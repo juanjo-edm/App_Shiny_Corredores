@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+
+# R / IDE
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Mac / sistema
+.DS_Store
+
+# Deploy metadata local
+rsconnect/
+
+# Credenciales y secretos locales
+*.json
+*.pem
+*.key
+.env
+.Renviron
+
+# Tests y docs (si no se usan en runtime)
+tests/
+testthat/
+notebooks/
+*.md
+
+# Artefactos temporales
+tmp/
+temp/
+*.log
+
+# Python/Node si existen en el repo
+node_modules/
+venv/
+.venv/
+__pycache__/

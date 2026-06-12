@@ -1,0 +1,31 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+.DS_Store
+
+rsconnect/
+shinytest2/
+tests/testthat/_snaps/
+
+*.Rprof
+*.log
+*.lock
+
+# Capas crudas opcionales demasiado grandes para GitHub.
+notebooks/data/raw/Capas de referencia/RedDepartamental.*
+notebooks/data/raw/Capas de referencia/RedVial_OD_5.*
+notebooks/data/raw/Capas de referencia/Red_Vial_Nacional.xml
+
+# Credenciales y secretos locales.
+*.json
+*.pem
+*.key
+.env
+.Renviron
+
+# Artefactos temporales de R y datos intermedios locales.
+*.Rtmp
+tmp/
+cache/

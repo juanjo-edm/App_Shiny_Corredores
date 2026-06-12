@@ -1,0 +1,296 @@
+---
+title: "Preparacion de geodata"
+author: "Juan Jose Echeverry de Mendoza"
+date: "`r format(Sys.Date())`"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 3
+editor_options:
+  chunk_output_type: console
+---
+
+# Proposito
+
+Este cuaderno documenta como se preparan los datos geograficos y tabulares que consume la app Shiny de corredores logisticos.
+
+No hace parte del arranque de la app. Es una bitacora de trazabilidad: parte de insumos crudos guardados en `notebooks/data/raw/`, explica las transformaciones principales y al final escribe los archivos finales en `data/`.
+
+## Entradas
+
+- `notebooks/data/raw/COLOMBIA/COLOMBIA.shp`: poligono oficial de Colombia.
+- `notebooks/data/raw/Capas de referencia/RedFerrea.shp`: red ferrea nacional.
+- `notebooks/data/raw/Capas de referencia/RedVial_OD_5.*`: red vial de referencia opcional. No se versiona en GitHub por tamano; queda documentada como insumo local historico.
+- `notebooks/data/raw/Capas de referencia/RedDepartamental.*`: red departamental de referencia opcional. No se versiona en GitHub por tamano; queda documentada como insumo local historico.
+- `notebooks/data/raw/proyectos_corredores_raw.xlsx`: proyectos de corredores.
+- `notebooks/data/raw/regiones_priorizadas_snapshot.xlsx`: snapshot actual de regiones priorizadas.
+- `notebooks/data/raw/regiones_snapshot.rds`: snapshot actual de poligonos de regiones priorizadas.
+
+## Salidas que usa la app
+
+- `data/proyectos_corredores.xlsx`
+- `data/Regiones_Priorizadas.xlsx`
+- `data/derivado/rios_ne_colombia.rds`
+- `data/derivado/ferrea_4326_simplificada.rds`
+- `data/derivado/regiones.rds`
+
+> Nota de trazabilidad: este cuaderno reconstruye `rios_ne_colombia.rds` y `ferrea_4326_simplificada.rds` desde fuentes crudas. Para `Regiones_Priorizadas.xlsx` y `regiones.rds`, la carpeta fuente original no contiene los insumos crudos; por eso se conserva un snapshot y se copia a la salida final.
+
+# Configuracion
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "sf",
+  "dplyr",
+  "rnaturalearth",
+  "rnaturalearthdata"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Instala estos paquetes antes de ejecutar el cuaderno: ",
+    paste(missing_packages, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(rnaturalearth)
+  library(rnaturalearthdata)
+})
+
+find_repo_root <- function(start = getwd()) {
+  current <- normalizePath(start, mustWork = TRUE)
+  repeat {
+    if (file.exists(file.path(current, "app.R"))) {
+      return(current)
+    }
+    parent <- dirname(current)
+    if (identical(parent, current)) {
+      stop("No se pudo encontrar la raiz del repo con app.R.", call. = FALSE)
+    }
+    current <- parent
+  }
+}
+
+repo_root <- find_repo_root()
+raw_dir <- file.path(repo_root, "notebooks", "data", "raw")
+app_data_dir <- file.path(repo_root, "data")
+derived_dir <- file.path(app_data_dir, "derivado")
+
+dir.create(derived_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Funcion auxiliar
+
+`ensure_schema()` estandariza objetos `sf` para que tengan columnas minimas (`name`, `scalerank`, `label_txt`) y una geometria uniforme. Esto ayuda a unir capas provenientes de fuentes distintas sin errores por columnas o tipos geometricos incompatibles.
+
+```{r helpers}
+ensure_schema <- function(x, geom_type = "MULTILINESTRING") {
+  stopifnot(inherits(x, "sf"))
+
+  if (!"name" %in% names(x)) {
+    x$name <- NA_character_
+  }
+  if (!"scalerank" %in% names(x)) {
+    x$scalerank <- NA_real_
+  }
+  if (!"label_txt" %in% names(x)) {
+    x$label_txt <- ifelse(is.na(x$name) | x$name == "", "Rio", x$name)
+  }
+
+  x <- dplyr::select(x, name, scalerank, label_txt, dplyr::everything())
+  suppressWarnings(sf::st_cast(x, geom_type))
+}
+```
+
+# Poligono de Colombia
+
+Primero se lee el shapefile nacional, se transforma a WGS84 (`EPSG:4326`), se corrigen geometrial invalidas y se disuelve en un unico poligono de pais.
+
+```{r colombia}
+colombia_path <- file.path(raw_dir, "COLOMBIA", "COLOMBIA.shp")
+stopifnot(file.exists(colombia_path))
+
+COL_POL <- sf::st_read(colombia_path, quiet = TRUE) |>
+  sf::st_transform(4326) |>
+  sf::st_geometry() |>
+  sf::st_make_valid() |>
+  sf::st_union() |>
+  sf::st_cast("MULTIPOLYGON")
+
+COL_POL <- sf::st_as_sf(
+  data.frame(id = 1),
+  geometry = sf::st_sfc(COL_POL, crs = 4326)
+)
+
+col_buf <- COL_POL |>
+  sf::st_make_valid() |>
+  sf::st_buffer(dist = 0.05)
+```
+
+El buffer evita perder rios fronterizos o lineas muy cercanas al limite nacional durante las intersecciones espaciales.
+
+# Rios Natural Earth
+
+Se descarga la capa de rios de Natural Earth en escala 10m. Si falla, se usa escala 50m como respaldo. Luego se recorta al area de Colombia, se simplifica y se aseguran rios estrategicos por nombre.
+
+```{r rios-natural-earth, message=FALSE, warning=FALSE}
+ne_rivers <- tryCatch(
+  rnaturalearth::ne_download(
+    scale = 10,
+    type = "rivers_lake_centerlines",
+    category = "physical",
+    returnclass = "sf"
+  ),
+  error = function(e) {
+    message("Natural Earth 10m fallo; usando 50m: ", e$message)
+    rnaturalearth::ne_download(
+      scale = 50,
+      type = "rivers_lake_centerlines",
+      category = "physical",
+      returnclass = "sf"
+    )
+  }
+)
+
+ne_rivers <- sf::st_transform(ne_rivers, 4326)
+
+if ("featurecla" %in% names(ne_rivers)) {
+  ne_rivers <- subset(ne_rivers, grepl("river", featurecla, ignore.case = TRUE))
+}
+
+bb <- sf::st_bbox(COL_POL)
+
+rios_co <- suppressWarnings(sf::st_crop(ne_rivers, bb))
+rios_co <- suppressWarnings(sf::st_cast(rios_co, "MULTILINESTRING"))
+rios_co <- sf::st_make_valid(rios_co)
+rios_co <- suppressWarnings(sf::st_intersection(rios_co, col_buf))
+rios_co <- sf::st_simplify(rios_co, dTolerance = 0.00025, preserveTopology = TRUE)
+
+if (requireNamespace("lwgeom", quietly = TRUE)) {
+  rios_co <- rios_co |>
+    sf::st_transform(3116) |>
+    lwgeom::st_snap_to_grid(size = 10) |>
+    sf::st_transform(4326)
+}
+
+rios_co <- ensure_schema(rios_co)
+```
+
+```{r rios-clave, message=FALSE, warning=FALSE}
+must <- c(
+  "Meta", "Guaviare", "Vichada", "Putumayo", "Caqueta", "Caquetá",
+  "Atrato", "Sinu", "Sinú", "Magdalena", "Cauca", "Arauca", "Orinoco"
+)
+
+add <- subset(ne_rivers, tolower(name) %in% tolower(must))
+
+if (nrow(add) > 0) {
+  add <- sf::st_make_valid(add)
+  add <- suppressWarnings(sf::st_intersection(add, col_buf))
+
+  if (nrow(add) > 0) {
+    add$label_txt <- ifelse(is.na(add$name) | add$name == "", "Rio", add$name)
+    add <- ensure_schema(add)
+
+    rios_co <- suppressWarnings(rbind(rios_co, add))
+    rios_co <- rios_co[!duplicated(sf::st_as_text(sf::st_geometry(rios_co))), ]
+  }
+}
+
+rios_co$label_txt <- ifelse(
+  is.na(rios_co$label_txt) | rios_co$label_txt == "",
+  ifelse(is.na(rios_co$name) | rios_co$name == "", "Rio", rios_co$name),
+  rios_co$label_txt
+)
+```
+
+# Red ferrea nacional
+
+La red ferrea se lee desde shapefile, se limpia, se recorta al buffer de Colombia, se simplifica y se etiqueta para que Leaflet pueda mostrar nombres en la app.
+
+```{r ferrea, message=FALSE, warning=FALSE}
+ferrea_path <- file.path(raw_dir, "Capas de referencia", "RedFerrea.shp")
+stopifnot(file.exists(ferrea_path))
+
+ferrea <- sf::st_read(ferrea_path, quiet = TRUE)
+ferrea <- suppressWarnings(tryCatch(sf::st_zm(ferrea, drop = TRUE, what = "ZM"), error = function(e) ferrea))
+
+ferrea <- sf::st_transform(ferrea, 4326)
+ferrea <- sf::st_make_valid(ferrea)
+ferrea <- suppressWarnings(sf::st_intersection(ferrea, col_buf))
+ferrea <- sf::st_simplify(ferrea, dTolerance = 0.0008)
+
+if (requireNamespace("lwgeom", quietly = TRUE)) {
+  ferrea <- ferrea |>
+    sf::st_transform(3116) |>
+    lwgeom::st_snap_to_grid(size = 10) |>
+    sf::st_transform(4326)
+}
+
+if (all(c("INICIO", "FINAL") %in% names(ferrea))) {
+  ferrea$name <- paste(ferrea$INICIO, ferrea$FINAL, sep = "-")
+}
+
+candidates <- intersect(c("NOMBRE", "Nombre", "name", "Name", "TRAMO", "ID"), names(ferrea))
+ferrea$label_txt <- if (length(candidates) > 0) ferrea[[candidates[1]]] else "Via ferrea"
+```
+
+# Salidas finales
+
+Se escriben los RDS derivados y se copian los Excel/snapshots a las rutas que carga la app.
+
+```{r exportar}
+rios_out <- file.path(derived_dir, "rios_ne_colombia.rds")
+ferrea_out <- file.path(derived_dir, "ferrea_4326_simplificada.rds")
+proyectos_out <- file.path(app_data_dir, "proyectos_corredores.xlsx")
+regiones_excel_out <- file.path(app_data_dir, "Regiones_Priorizadas.xlsx")
+regiones_rds_out <- file.path(derived_dir, "regiones.rds")
+
+saveRDS(rios_co, rios_out)
+saveRDS(ferrea, ferrea_out)
+
+stopifnot(file.copy(
+  from = file.path(raw_dir, "proyectos_corredores_raw.xlsx"),
+  to = proyectos_out,
+  overwrite = TRUE
+))
+
+stopifnot(file.copy(
+  from = file.path(raw_dir, "regiones_priorizadas_snapshot.xlsx"),
+  to = regiones_excel_out,
+  overwrite = TRUE
+))
+
+stopifnot(file.copy(
+  from = file.path(raw_dir, "regiones_snapshot.rds"),
+  to = regiones_rds_out,
+  overwrite = TRUE
+))
+```
+
+# Validacion
+
+```{r validar-salidas}
+outputs <- c(
+  proyectos_out,
+  regiones_excel_out,
+  rios_out,
+  ferrea_out,
+  regiones_rds_out
+)
+
+stopifnot(all(file.exists(outputs)))
+
+data.frame(
+  archivo = sub(paste0("^", repo_root, "/?"), "", outputs),
+  bytes = file.info(outputs)$size,
+  row.names = NULL
+)
+```
+
+Con esto, la app puede cargar los datos desde `data/` sin conocer los insumos crudos ni ejecutar este cuaderno en runtime.
