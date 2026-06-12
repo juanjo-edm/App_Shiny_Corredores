@@ -82,6 +82,16 @@ Rscript app.R
 
 La app toma el puerto desde `PORT`; si no existe, usa `8080`.
 
+## Manifest para Posit Connect Cloud
+
+Posit Connect Cloud requiere un `manifest.json` junto a `app.R` para detectar las dependencias R de la app. Regeneralo desde la raiz del repo con:
+
+```bash
+Rscript scripts/create_manifest.R
+```
+
+El script crea un manifest solo con los archivos necesarios para runtime: `app.R`, `R/`, `data/` y `www/`.
+
 ## Variables de entorno
 
 | Variable | Uso | Default |

@@ -20,6 +20,7 @@ notebooks/data/raw/Capas de referencia/Red_Vial_Nacional.xml
 
 # Credenciales y secretos locales.
 *.json
+!manifest.json
 *.pem
 *.key
 .env
